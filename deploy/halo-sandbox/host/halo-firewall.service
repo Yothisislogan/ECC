@@ -1,0 +1,18 @@
+[Unit]
+Description=Halo sandbox host firewall (nftables table inet halo)
+# Load before networking and before Docker, so no container ever runs unfiltered.
+DefaultDependencies=no
+Before=network-pre.target docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/halo/halo-firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/halo/halo-firewall.nft
+ExecStop=/usr/sbin/nft delete table inet halo
+
+[Install]
+WantedBy=multi-user.target
+# Fail closed: Docker does not start if this firewall failed to load.
+RequiredBy=docker.service

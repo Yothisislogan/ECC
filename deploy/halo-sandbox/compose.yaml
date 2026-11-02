@@ -1,0 +1,173 @@
+# Halo sandbox: a local LLM plus a sandboxed coding agent whose only way out
+# is an allowlisting HTTPS gateway. See README.md.
+#
+# Nothing in this file publishes a port. Remote access goes out through the
+# optional Cloudflare Tunnel (profile "tunnel"), never in through your router.
+#
+#   docker compose up -d                      # llm + gateway
+#   docker compose run --rm agent             # interactive sandbox shell
+#   docker compose --profile tunnel up -d     # also start cloudflared
+name: halo
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+services:
+  # Local inference. Reachable only on internal networks: it has no route to
+  # the internet, so the model server cannot phone home or download anything.
+  llm:
+    <<: *hardened
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b11854@sha256:2716be5463dcecd02ace322f77fa0ea10b7168c5c8f0e45458b303541fca6632
+    user: "${HALO_UID:-1000}:${HALO_GID:-1000}"
+    # Numeric host GIDs that own the GPU render node (scripts/setup.sh fills them).
+    group_add: ["${HALO_RENDER_GID:?run scripts/setup.sh}", "${HALO_VIDEO_GID:?run scripts/setup.sh}"]
+    # Only the render node: enough for Vulkan compute, no display control.
+    devices: ["${HALO_RENDER_NODE:-/dev/dri/renderD128}:${HALO_RENDER_NODE:-/dev/dri/renderD128}"]
+    environment:
+      LLAMA_API_KEY: ${LLM_API_KEY:?run scripts/setup.sh}
+      XDG_CACHE_HOME: /tmp/cache
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    volumes:
+      - ${HALO_MODELS_DIR:-./models}:/models:ro
+    command:
+      - --model
+      - /models/${LLM_MODEL_FILE:-model.gguf}
+      - --alias
+      - ${LLM_ALIAS:-local-model}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --n-gpu-layers
+      - "999"
+      - --ctx-size
+      - "${LLM_CTX_SIZE:-65536}"
+      - --jinja
+      - --no-slots
+      - --offline
+    pids_limit: 512
+    networks: [sandbox, llm-edge]
+
+  # The only container with internet access. Allows HTTPS to the names in
+  # allowed-domains.txt and nothing else; logs every request it handles.
+  gateway:
+    <<: *hardened
+    build: ./gateway
+    image: halo-gateway:local
+    user: "${HALO_UID:-1000}:${HALO_GID:-1000}"
+    environment:
+      CF_ACCESS_CLIENT_ID: ${CF_ACCESS_CLIENT_ID:-}
+      CF_ACCESS_CLIENT_SECRET: ${CF_ACCESS_CLIENT_SECRET:-}
+    volumes:
+      - ${HALO_ALLOWLIST:-./allowed-domains.txt}:/etc/squid/allowed-domains.txt:ro
+      - ${HALO_CF_ACCESS_DOMAINS:-./cf-access-domains.txt}:/etc/squid/cf-access-domains.txt:ro
+      - ${HALO_CA_DIR:-./gateway/ca}:/etc/squid/ca:ro
+    tmpfs:
+      - /run/squid:uid=${HALO_UID:-1000},gid=${HALO_GID:-1000},mode=0700,size=64m
+    dns: ["${HALO_DNS_PRIMARY:-1.1.1.1}", "${HALO_DNS_SECONDARY:-1.0.0.1}"]
+    pids_limit: 256
+    mem_limit: 512m
+    networks: [sandbox, egress]
+
+  # The coding agent. Internal network only: it can talk to the llm and the
+  # gateway, nothing else. It trusts only the gateway's private CA.
+  agent:
+    <<: *hardened
+    restart: "no"
+    profiles: [agent]
+    build:
+      context: ./agent
+      args:
+        AGENT_UID: ${HALO_UID:-1000}
+        AGENT_GID: ${HALO_GID:-1000}
+      secrets: [build_ca]
+    image: halo-agent:local
+    user: "${HALO_UID:-1000}:${HALO_GID:-1000}"
+    init: true
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    depends_on: [gateway, llm]
+    pids_limit: 1024
+    mem_limit: ${AGENT_MEM_LIMIT:-16g}
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    volumes:
+      - ${HALO_WORKSPACE:-./workspace}:/workspace
+      - agent-home:/home/agent
+      - ${HALO_CA_DIR:-./gateway/ca}/gateway-ca.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    environment:
+      HTTPS_PROXY: http://gateway:3128
+      HTTP_PROXY: http://gateway:3128
+      https_proxy: http://gateway:3128
+      http_proxy: http://gateway:3128
+      NO_PROXY: llm,localhost,127.0.0.1
+      no_proxy: llm,localhost,127.0.0.1
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      GIT_SSL_CAINFO: /etc/ssl/certs/ca-certificates.crt
+      ANTHROPIC_BASE_URL: http://llm:8080
+      ANTHROPIC_AUTH_TOKEN: ${LLM_API_KEY:-}
+      ANTHROPIC_MODEL: ${LLM_ALIAS:-local-model}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${LLM_ALIAS:-local-model}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${LLM_ALIAS:-local-model}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${LLM_ALIAS:-local-model}
+      CLAUDE_CODE_SUBAGENT_MODEL: ${LLM_ALIAS:-local-model}
+      # Tell Claude Code the model's real window so it compacts in time.
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: "${LLM_CTX_SIZE:-65536}"
+    networks: [sandbox]
+
+  # Optional: Cloudflare Tunnel for remote access to the llm's chat UI/API.
+  # Outbound-only (port 7844); put a Cloudflare Access policy in front of it.
+  cloudflared:
+    <<: *hardened
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:2026.10.1@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    dns: ["${HALO_DNS_PRIMARY:-1.1.1.1}", "${HALO_DNS_SECONDARY:-1.0.0.1}"]
+    depends_on: [llm]
+    pids_limit: 128
+    mem_limit: 256m
+    networks: [llm-edge, tunnel]
+
+networks:
+  # agent <-> gateway <-> llm. No route to the internet or the LAN. Docker
+  # still lets it reach services on the host's bridge address; the host
+  # firewall (host/halo-firewall.nft) is what closes that.
+  sandbox:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: halo-sandbox
+  # gateway -> internet (host firewall: TCP 443 + DNS only).
+  egress:
+    driver_opts:
+      com.docker.network.bridge.name: halo-egress
+  # cloudflared <-> llm only.
+  llm-edge:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: halo-llmedge
+  # cloudflared -> Cloudflare edge (host firewall: port 7844 + DNS only).
+  tunnel:
+    driver_opts:
+      com.docker.network.bridge.name: halo-tunnel
+
+volumes:
+  agent-home:
+
+secrets:
+  # Root CA of a TLS-inspecting network, used only while building the agent
+  # image. scripts/setup.sh creates it empty. Must live inside this directory.
+  build_ca:
+    file: ${HALO_BUILD_CA:-./build-ca.pem}

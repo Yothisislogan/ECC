@@ -1,0 +1,13 @@
+# Sites the sandboxed LLM may reach over HTTPS. Everything else is refused.
+#
+# One host name per line. Comments (#) and blank lines are ignored.
+#   docs.example.com     exactly that host
+#   .example.com         example.com and every subdomain of it
+#
+# List only sites you control. Any site that accepts uploads, comments or
+# arbitrary query logging (GitHub, pastebins, chat apps, search engines) is a
+# way for a prompt-injected model to send your data out, so keep them off.
+#
+# After editing: scripts/make-ca.sh && docker compose up -d --force-recreate gateway
+#
+# Empty (the default) means the sandbox has no web access at all.

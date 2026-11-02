@@ -1,0 +1,6 @@
+# Allowlisted hosts that sit behind Cloudflare Access and should receive the
+# gateway's service token (CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET in .env).
+# Same format as allowed-domains.txt. Every entry must also be allowlisted.
+#
+# The token is added by the gateway, so it never enters the sandbox and the
+# model cannot read or leak it.

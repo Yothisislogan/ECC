@@ -1,0 +1,88 @@
+#!/usr/sbin/nft -f
+# Host firewall for the halo sandbox.
+#
+# This is its own nftables table, independent of Docker's rules. It is loaded
+# at boot BEFORE docker.service (see halo-firewall.service), so containers are
+# never running unfiltered. A drop in any nftables base chain is final, so
+# these rules hold even though Docker's own chains would accept the traffic.
+#
+# Bridge names come from compose.yaml (com.docker.network.bridge.name).
+# Keep HALO_DNS in sync with HALO_DNS_PRIMARY / HALO_DNS_SECONDARY in .env.
+
+define HALO_DNS = { 1.1.1.1, 1.0.0.1 }
+
+# Idempotent reload: create the table if missing, then replace it atomically.
+table inet halo
+delete table inet halo
+
+table inet halo {
+    # Never reachable from the containers: LAN, router, this host, CGNAT,
+    # link-local (cloud metadata) and multicast.
+    set blocked_v4 {
+        type ipv4_addr
+        flags interval
+        elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+                     169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
+                     224.0.0.0/3 }
+    }
+
+    chain forward {
+        type filter hook forward priority filter - 10; policy accept;
+
+        # Replies to connections allowed below.
+        ct state established,related accept
+
+        # Internal networks: nothing may leave the bridge. Docker already
+        # isolates internal networks; this is a second, independent layer.
+        iifname "halo-sandbox" oifname != "halo-sandbox" counter drop
+        iifname "halo-llmedge" oifname != "halo-llmedge" counter drop
+
+        iifname "halo-egress" oifname != "halo-egress" jump from_gateway
+        iifname "halo-tunnel" oifname != "halo-tunnel" jump from_tunnel
+    }
+
+    # The egress gateway: HTTPS and DNS only, never to private addresses.
+    chain from_gateway {
+        ip daddr $HALO_DNS meta l4proto { tcp, udp } th dport 53 accept
+        meta nfproto ipv6 counter drop
+        ip daddr @blocked_v4 counter drop
+        tcp dport 443 accept
+        counter drop
+    }
+
+    # cloudflared: the tunnel port (TCP for http2, UDP for QUIC) and DNS only.
+    chain from_tunnel {
+        ip daddr $HALO_DNS meta l4proto { tcp, udp } th dport 53 accept
+        meta nfproto ipv6 counter drop
+        ip daddr @blocked_v4 counter drop
+        meta l4proto { tcp, udp } th dport 7844 accept
+        counter drop
+    }
+
+    # Containers must not open connections to services on the host itself
+    # (sshd, a local Ollama, the Docker API, ...). Replies to connections the
+    # host started are still allowed.
+    chain input {
+        type filter hook input priority filter - 10; policy accept;
+        ct state established,related accept
+        iifname { "halo-sandbox", "halo-llmedge", "halo-egress", "halo-tunnel" } counter drop
+    }
+
+    # OPTIONAL "no outbound ports" for the host itself. Uncomment to allow host
+    # processes only DNS (to HALO_DNS), DHCP, NTP, HTTPS and the tunnel port.
+    # This breaks anything else the host does (ssh to other machines,
+    # Tailscale, git over ssh, ...), so test it from a console first.
+    #
+    # chain output {
+    #     type filter hook output priority filter - 10; policy drop;
+    #     oifname "lo" accept
+    #     ct state established,related accept
+    #     oifname { "halo-sandbox", "halo-llmedge", "halo-egress", "halo-tunnel" } accept
+    #     ip daddr $HALO_DNS meta l4proto { tcp, udp } th dport 53 accept
+    #     udp dport { 67, 123 } accept
+    #     meta l4proto { tcp, udp } th dport 7844 accept
+    #     tcp dport 443 accept
+    #     icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept
+    #     counter drop
+    # }
+}

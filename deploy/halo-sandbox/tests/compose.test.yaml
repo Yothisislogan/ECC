@@ -1,0 +1,59 @@
+# Overrides for tests/boundary-test.sh. Replaces the GPU model server with a
+# stub and adds a fake internet, so the network boundary can be proven on any
+# Docker host without a GPU, a model or real internet access.
+services:
+  llm:
+    image: halo-agent:local
+    group_add: !reset []
+    devices: !reset []
+    entrypoint: ["sh", "-c"]
+    command:
+      - mkdir -p /tmp/www && echo ok > /tmp/www/health && cd /tmp/www && exec python3 -m http.server 8080
+
+  # Speaks just enough of the Anthropic Messages API to run `claude -p`, and
+  # logs every request, so the test can see exactly what the harness calls.
+  fake-anthropic:
+    image: halo-agent:local
+    read_only: true
+    entrypoint: ["python3", "/stub.py"]
+    volumes:
+      - ./tests/fake-anthropic.py:/stub.py:ro
+    networks: [sandbox]
+
+  gateway:
+    volumes:
+      # The gateway must verify the fake sites against the fake public CA.
+      - ${HALO_TEST_DIR:?}/certs/test-public-ca.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    networks:
+      testlan: {}
+
+  # allowed.test, evil.test, shared-cert.test and untrusted.test on a
+  # public-looking address.
+  site-public:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    volumes:
+      - ./tests/sites/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${HALO_TEST_DIR:?}/certs:/certs:ro
+    networks:
+      egress:
+        ipv4_address: 203.0.113.10
+        aliases: [allowed.test, evil.test, shared-cert.test, untrusted.test]
+
+  # rebind.test is allowlisted but resolves to a private (LAN) address.
+  site-private:
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    volumes:
+      - ./tests/sites/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${HALO_TEST_DIR:?}/certs:/certs:ro
+    networks:
+      testlan:
+        ipv4_address: 10.99.0.10
+        aliases: [rebind.test]
+
+networks:
+  egress:
+    ipam:
+      config: [{ subnet: 203.0.113.0/24 }]
+  testlan:
+    ipam:
+      config: [{ subnet: 10.99.0.0/24 }]

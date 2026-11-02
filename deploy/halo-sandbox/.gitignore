@@ -1,0 +1,6 @@
+.env
+build-ca.pem
+.build-ca.test.pem
+gateway/ca/
+workspace/
+models/
